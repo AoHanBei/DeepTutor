@@ -115,6 +115,23 @@ test("explicit retryable flags take precedence over status fallbacks", async () 
   }
 });
 
+test("without an explicit flag every retryable status falls back to true", async () => {
+  // 503 alone does not prove the fallback arm: it is one of several statuses
+  // the arm answers for, and a regression that narrowed the set would still
+  // pass. Pin each status the fallback claims.
+  for (const status of [408, 429, 500, 503]) {
+    const restore = withFetch(async () =>
+      Response.json({ error_code: "opaque" }, { status }),
+    );
+    try {
+      const error = await expectApiError(() => requestJson("/turn"));
+      assert.equal(error.retryable, true, `status ${status}`);
+    } finally {
+      restore();
+    }
+  }
+});
+
 test("invalid JSON success becomes a normalized response error", async () => {
   const restore = withFetch(
     async () =>
