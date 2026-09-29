@@ -211,7 +211,7 @@ def _clear_detached_runtime(paths: DetachedLauncherPaths, token: str) -> None:
         paths.stop.unlink(missing_ok=True)
 
 
-def _no_window_kwargs() -> dict[str, int]:
+def _no_window_kwargs() -> dict[str, Any]:
     """``Popen`` keywords that keep Windows from allocating a console window.
 
     The detached worker runs with ``DETACHED_PROCESS``, i.e. with no console of
@@ -1214,8 +1214,10 @@ def _handoff_pending_update(
     """Hand a pending Web update to a detached worker before shutdown."""
 
     from deeptutor.services.app_update import (
+        SYSTEMD_UPDATE_REASON,
         UpdateJobStore,
         launch_update_worker,
+        running_under_systemd_service,
         update_store_root,
     )
 
@@ -1225,6 +1227,14 @@ def _handoff_pending_update(
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
         return False
     if job.status != "pending":
+        return False
+    # A pending job from an older backend can reach this launcher despite the
+    # API guard. Keep the service alive: setsid does not leave its cgroup.
+    if running_under_systemd_service():
+        try:
+            store.mark_failed(job.id, SYSTEMD_UPDATE_REASON)
+        except Exception as exc:
+            _log(f"Could not record rejected systemd update: {exc}")
         return False
     try:
         store.prepare_handoff(

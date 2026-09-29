@@ -883,7 +883,29 @@ def _request_snapshot_metadata(
         "enabledTools": _string_list(payload.get("tools")),
         "knowledgeBases": _string_list(payload.get("knowledge_bases")),
         "language": str(payload.get("language", "en") or "en"),
+        # Keep empty values too. A failed turn can be resent after the
+        # conversation preferences have changed; absence would otherwise
+        # cause the retry to pick up the newer tools, sources, or persona.
+        "config": dict(config),
+        "notebookReferences": list(notebook_references),
+        "historyReferences": list(history_references),
+        "partnerGroupReferences": list(partner_group_references),
+        "questionNotebookReferences": list(question_notebook_references),
+        "bookReferences": list(book_references),
+        "readingReferences": list(reading_references),
+        "memoryReferences": list(memory_references),
+        "skills": _string_list(payload.get("skills")),
+        "mcp": _string_list(payload.get("mcp")),
+        "persona": persona,
     }
+    for payload_key, snapshot_key in (
+        ("workspace_id", "workspaceId"),
+        ("course_id", "courseId"),
+        ("mastery_session_mode", "masterySessionMode"),
+        ("auto_route", "autoRoute"),
+    ):
+        if payload_key in payload:
+            snapshot[snapshot_key] = payload[payload_key]
     for payload_key, snapshot_key in (
         ("consult_partner_id", "consultPartnerId"),
         ("partner_discussion_group_id", "partnerDiscussionGroupId"),
@@ -891,30 +913,24 @@ def _request_snapshot_metadata(
         if payload_key in payload:
             snapshot[snapshot_key] = payload[payload_key]
     workspace_mode = _workspace_mode(payload.get("workspace_mode"), capability=capability)
-    if workspace_mode:
-        snapshot["workspaceMode"] = workspace_mode
+    snapshot["workspaceMode"] = workspace_mode
+    if payload.get("capability_once"):
+        # Kept so a regenerate runs in this mode again without adopting it.
+        snapshot["capabilityOnce"] = True
     if attachments:
         snapshot["attachments"] = attachments
-    if config:
-        snapshot["config"] = dict(config)
     capability_route = payload.get("capability_route")
     if isinstance(capability_route, dict):
         snapshot["capabilityRoute"] = dict(capability_route)
-    if notebook_references:
-        snapshot["notebookReferences"] = notebook_references
-    if history_references:
-        snapshot["historyReferences"] = history_references
-    if partner_group_references:
-        snapshot["partnerGroupReferences"] = partner_group_references
-    if question_notebook_references:
-        snapshot["questionNotebookReferences"] = question_notebook_references
-    if book_references:
-        snapshot["bookReferences"] = book_references
-    if reading_references:
-        snapshot["readingReferences"] = list(reading_references)
     mastery_path_id = _mastery_path_id(payload.get("mastery_path_id"))
-    if mastery_path_id:
-        snapshot["masteryPathId"] = mastery_path_id
+    snapshot["masteryPathId"] = mastery_path_id
+    for payload_key, snapshot_key in (
+        ("mastery_answer", "masteryAnswer"),
+        ("mastery_skip", "masterySkip"),
+    ):
+        value = payload.get(payload_key)
+        if isinstance(value, dict) and value.get("question_id"):
+            snapshot[snapshot_key] = dict(value)
     # Persisted so a regenerate re-runs with the same document open. Without it
     # the reading capability would be inactive on the retry and the answer would
     # silently lose its grounding.
@@ -927,18 +943,26 @@ def _request_snapshot_metadata(
         if reading_material_revision is not None:
             snapshot["readingMaterialRevision"] = reading_material_revision
     reading_workspace_id = _reading_workspace_id(payload.get("reading_workspace_id"))
-    if reading_workspace_id:
-        snapshot["readingWorkspaceId"] = reading_workspace_id
+    snapshot["readingWorkspaceId"] = reading_workspace_id
+    # The passage the question was asked about. Without it the bubble shows a
+    # bare "Explain this" with nothing to say what "this" was, and a
+    # regenerate re-asks it about no passage at all.
+    viewport = _reading_viewport(payload.get("reading_viewport"))
+    if reading_material_id and viewport.get("selection"):
+        snapshot["readingSelection"] = {
+            "quote": viewport["selection"],
+            "locator": viewport.get("locator", 0),
+        }
     timed_media_id = _timed_media_id(payload.get("timed_media_id"))
     if timed_media_id:
         snapshot["timedMediaId"] = timed_media_id
-    if persona:
-        snapshot["persona"] = persona
-    if memory_references:
-        snapshot["memoryReferences"] = memory_references
     if llm_selection:
         snapshot["llmSelection"] = llm_selection
-    return {"request_snapshot": snapshot}
+    metadata: dict[str, Any] = {"request_snapshot": snapshot}
+    client_submission_id = payload.get("client_submission_id")
+    if isinstance(client_submission_id, str) and client_submission_id:
+        metadata["client_submission_id"] = client_submission_id
+    return metadata
 
 
 def _format_question_bank_entry(entry: dict[str, Any]) -> str:

@@ -113,6 +113,12 @@ export interface AnnotationItem {
   rects: NormalisedRect[];
   source_anchor: string;
   selectors?: ReadingTextSelector[];
+  /**
+   * Selector validity against the current content revision. Backend revision
+   * migration marks rows "unresolved" or "ambiguous" when the stored quote
+   * no longer identifies exactly one passage in the new text.
+   */
+  resolution?: "resolved" | "unresolved" | "ambiguous";
   /** "user" or "assistant" — the model can annotate too. */
   author: string;
   created_at: number;
@@ -404,6 +410,7 @@ export async function submitReadingQuizAnswers(
     section_title?: string;
     session_id?: string;
     turn_id?: string;
+    submission_id?: string;
     answers: ReadingQuizAnswer[];
   },
 ): Promise<ReadingQuizAnswerVerdict[]> {
@@ -419,6 +426,7 @@ export async function submitReadingQuizAnswers(
           section_title: payload.section_title || "",
           session_id: payload.session_id || "",
           turn_id: payload.turn_id || "",
+          submission_id: payload.submission_id || "",
           answers: payload.answers.map((row) => ({
             question_id: row.question_id,
             selected_index: row.selected_index,
@@ -433,6 +441,10 @@ export async function submitReadingQuizAnswers(
 /** URL of the original bytes. Served with Range support so pdf.js can stream. */
 export function rawMaterialUrl(materialId: string): string {
   return apiUrl(`${BASE}/materials/${materialId}/raw`);
+}
+
+export function renderMaterialUrl(materialId: string): string {
+  return apiUrl(`${BASE}/materials/${materialId}/render`);
 }
 
 export async function getReadingPosition(

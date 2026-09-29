@@ -5,14 +5,13 @@
  * Header carries identity + run state; everything else lives in the tabs.
  */
 
-import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import {
   ArrowLeft,
   Archive,
   BookmarkPlus,
-  Cloud,
   Download,
   Link2,
   Loader2,
@@ -24,10 +23,14 @@ import {
   Trash2,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import Tooltip from "@/shared/ui/Tooltip";
 import {
   archivePartnerSession,
   destroyPartner,
   getPartner,
+  getPartnerSessions,
+  getPartnerWebContinuity,
+  setPartnerWebContinuity,
   startPartner,
   stopPartner,
   type PartnerInfo,
@@ -38,10 +41,8 @@ import {
 } from "@/lib/chat-export";
 import {
   freshPartnerSessionKey,
-  getPartnerSessionRoaming,
-  loadPartnerSessionKey,
+  initializePartnerSessionKey,
   persistPartnerSessionKey,
-  updatePartnerSessionRoaming,
 } from "@/lib/partner-session";
 import PartnerAvatar from "@/components/partners/PartnerAvatar";
 import PartnerChat from "@/components/partners/PartnerChat";
@@ -53,6 +54,7 @@ import SaveToNotebookModal, {
   type NotebookSaveMessage,
   type NotebookSavePayload,
 } from "@/components/notebook/SaveToNotebookModal";
+import { useAuthStatus } from "@/hooks/useAuthStatus";
 
 type Tab = "chat" | "configure" | "channels" | "archive";
 
@@ -62,6 +64,7 @@ function PartnerDetail() {
   const router = useRouter();
   const { t } = useTranslation();
   const partnerId = params.partnerId;
+  const auth = useAuthStatus();
 
   const initialTab = (searchParams.get("tab") as Tab) || "chat";
   const [tab, setTab] = useState<Tab>(
@@ -89,79 +92,181 @@ function PartnerDetail() {
   );
   const [showSaveModal, setShowSaveModal] = useState(false);
   const [archiveBusy, setArchiveBusy] = useState(false);
-  const [sessionRoaming, setSessionRoaming] = useState(false);
-  const [roamingBusy, setRoamingBusy] = useState(false);
   // The active web session key lives here so the Archive tab's Resume can
   // point the (always-mounted) Chat tab at a different conversation.
   const [sessionKey, setSessionKey] = useState("");
+  const [localSessionKey, setLocalSessionKey] = useState("");
+  const [continuityEnabled, setContinuityEnabled] = useState(false);
+  const [continuityReady, setContinuityReady] = useState(false);
+  const [continuityBusy, setContinuityBusy] = useState(false);
+  const [continuityError, setContinuityError] = useState(false);
+  const [runtimeContinuityError, setRuntimeContinuityError] = useState(false);
+  const [continuityRetry, setContinuityRetry] = useState(0);
+  const [switchingSession, setSwitchingSession] = useState(false);
+  const [chatBusy, setChatBusy] = useState(false);
+  const selectionEpochRef = useRef(0);
+  const refreshInFlightRef = useRef(false);
+  const selectionMutationRef = useRef(false);
+  const accountId = auth.userId ?? (!auth.enabled && auth.statusAvailable ? "local-admin" : null);
+
   useEffect(() => {
+    if (auth.loading) return;
+    if (!accountId) {
+      setContinuityError(true);
+      return;
+    }
     let cancelled = false;
-    void getPartnerSessionRoaming(partnerId)
-      .then((setting) => {
-        if (cancelled) return;
-        setSessionRoaming(setting.enabled);
-        if (setting.enabled && setting.session_key) {
-          // Keep this browser's fallback aligned with the last roaming
-          // conversation, so turning roaming off does not jump backwards.
-          persistPartnerSessionKey(partnerId, setting.session_key);
-          setSessionKey(setting.session_key);
-        } else {
-          setSessionKey(loadPartnerSessionKey(partnerId));
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setSessionKey(loadPartnerSessionKey(partnerId));
-      });
+    setContinuityReady(false);
+    setContinuityError(false);
+    setRuntimeContinuityError(false);
+    void (async () => {
+      const localKey = await initializePartnerSessionKey(
+        partnerId,
+        accountId,
+        {
+          enabled: auth.enabled,
+          isAdmin: auth.isAdmin,
+          statusAvailable: auth.statusAvailable,
+        },
+        async () => (await getPartnerSessions(partnerId)).map((item) => item.session_key),
+      );
+      const state = await getPartnerWebContinuity(partnerId);
+      if (cancelled) return;
+      setLocalSessionKey(localKey);
+      setContinuityEnabled(state.enabled);
+      setSessionKey(state.enabled && state.session_key ? state.session_key : localKey);
+      setContinuityReady(true);
+    })().catch(() => {
+      if (!cancelled) setContinuityError(true);
+    });
     return () => {
       cancelled = true;
     };
-  }, [partnerId]);
+  }, [partnerId, auth.loading, auth.enabled, auth.isAdmin, auth.statusAvailable, accountId, continuityRetry]);
+
+  const refreshAuthoritative = useCallback(async (required = false) => {
+    if (!required && (refreshInFlightRef.current || selectionMutationRef.current)) return;
+    refreshInFlightRef.current = true;
+    const epoch = selectionEpochRef.current;
+    try {
+      const state = await getPartnerWebContinuity(partnerId);
+      if (epoch !== selectionEpochRef.current) return;
+      setContinuityEnabled(state.enabled);
+      setSessionKey(state.enabled && state.session_key ? state.session_key : localSessionKey);
+      setRuntimeContinuityError(false);
+    } catch (error) {
+      if (required) {
+        setRuntimeContinuityError(true);
+        setToast(error instanceof Error ? error.message : t("Load failed"));
+      }
+    } finally {
+      refreshInFlightRef.current = false;
+    }
+  }, [partnerId, localSessionKey, t]);
+
+  // A second browser can change the selected conversation. Pick it up when
+  // this page becomes active, without moving a turn that is still streaming.
+  useEffect(() => {
+    if (!continuityReady) return;
+    const refresh = () => {
+      if (document.visibilityState !== "visible" || chatBusy || continuityBusy || switchingSession) return;
+      void refreshAuthoritative();
+    };
+    const timer = continuityEnabled ? window.setInterval(refresh, 15_000) : null;
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      if (timer !== null) window.clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [continuityReady, continuityEnabled, chatBusy, continuityBusy, switchingSession, refreshAuthoritative]);
+
+  const reconcileSelection = useCallback(async () => {
+    selectionEpochRef.current += 1;
+    selectionMutationRef.current = true;
+    setSwitchingSession(true);
+    try {
+      await refreshAuthoritative(true);
+    } finally {
+      selectionMutationRef.current = false;
+      setSwitchingSession(false);
+    }
+  }, [refreshAuthoritative]);
+  const handleSelectionStale = useCallback(() => reconcileSelection(), [reconcileSelection]);
+
   const changeSessionKey = useCallback(
-    async (key: string) => {
-      persistPartnerSessionKey(partnerId, key);
+    async (key: string, alreadySaved = false) => {
+      selectionEpochRef.current += 1;
       setSessionKey(key);
-      if (!sessionRoaming) return;
-      try {
-        await updatePartnerSessionRoaming(partnerId, true, key);
-      } catch (error) {
-        setToast(
-          error instanceof Error
-            ? error.message
-            : t("Could not update Partner session roaming."),
-        );
+      if (continuityEnabled) {
+        if (alreadySaved) return;
+        selectionMutationRef.current = true;
+        setSwitchingSession(true);
+        try {
+          const state = await setPartnerWebContinuity(partnerId, {
+            enabled: true,
+            session_key: key,
+          });
+          if (state.session_key && state.session_key !== key) setSessionKey(state.session_key);
+        } catch (error) {
+          setToast(error instanceof Error ? error.message : t("Action failed"));
+          await reconcileSelection();
+        } finally {
+          selectionMutationRef.current = false;
+          setSwitchingSession(false);
+        }
+      } else {
+        if (accountId) persistPartnerSessionKey(partnerId, key, accountId);
+        setLocalSessionKey(key);
       }
     },
-    [partnerId, sessionRoaming, t],
+    [partnerId, continuityEnabled, accountId, reconcileSelection, t],
   );
 
-  const toggleSessionRoaming = useCallback(async () => {
-    if (!sessionKey || roamingBusy) return;
-    setRoamingBusy(true);
+  const toggleContinuity = useCallback(async () => {
+    if (!continuityReady || continuityBusy || switchingSession || runtimeContinuityError || chatBusy || !sessionKey) return;
+    selectionEpochRef.current += 1;
+    selectionMutationRef.current = true;
+    setContinuityBusy(true);
     try {
-      const next = await updatePartnerSessionRoaming(
-        partnerId,
-        !sessionRoaming,
-        sessionRoaming ? undefined : sessionKey,
-      );
-      setSessionRoaming(next.enabled);
-      if (next.enabled && next.session_key) {
-        persistPartnerSessionKey(partnerId, next.session_key);
-        setSessionKey(next.session_key);
-        setToast(t("Partner conversation roaming enabled"));
+      if (continuityEnabled) {
+        await setPartnerWebContinuity(partnerId, {
+          enabled: false,
+          session_key: null,
+        });
+        const localKey = freshPartnerSessionKey();
+        if (accountId) persistPartnerSessionKey(partnerId, localKey, accountId);
+        setLocalSessionKey(localKey);
+        setSessionKey(localKey);
+        setContinuityEnabled(false);
       } else {
-        setSessionKey(loadPartnerSessionKey(partnerId));
-        setToast(t("Partner conversations stay in this browser"));
+        await setPartnerWebContinuity(partnerId, {
+          enabled: true,
+          session_key: sessionKey,
+        });
+        setContinuityEnabled(true);
       }
     } catch (error) {
-      setToast(
-        error instanceof Error
-          ? error.message
-          : t("Could not update Partner session roaming."),
-      );
+      setToast(error instanceof Error ? error.message : t("Action failed"));
+      await refreshAuthoritative(true);
     } finally {
-      setRoamingBusy(false);
+      selectionMutationRef.current = false;
+      setContinuityBusy(false);
     }
-  }, [partnerId, roamingBusy, sessionKey, sessionRoaming, t]);
+  }, [
+    accountId,
+    chatBusy,
+    continuityBusy,
+    continuityEnabled,
+    continuityReady,
+    runtimeContinuityError,
+    switchingSession,
+    partnerId,
+    refreshAuthoritative,
+    sessionKey,
+    t,
+  ]);
 
   useEffect(() => {
     if (!toast) return;
@@ -226,9 +331,14 @@ function PartnerDetail() {
     if (!sessionKey || chatMessages.length === 0 || archiveBusy) return;
     setArchiveBusy(true);
     try {
-      await archivePartnerSession(partnerId, sessionKey);
+      const result = await archivePartnerSession(partnerId, sessionKey);
       setChatMessages([]);
-      await changeSessionKey(freshPartnerSessionKey());
+      if (continuityEnabled) {
+        if (result.active_session_key) changeSessionKey(result.active_session_key, true);
+        else await reconcileSelection();
+      } else {
+        changeSessionKey(freshPartnerSessionKey());
+      }
       setToast(t("Archived conversation"));
     } catch (error) {
       setToast(error instanceof Error ? error.message : t("Action failed"));
@@ -239,7 +349,9 @@ function PartnerDetail() {
     archiveBusy,
     changeSessionKey,
     chatMessages.length,
+    continuityEnabled,
     partnerId,
+    reconcileSelection,
     sessionKey,
     t,
   ]);
@@ -297,7 +409,7 @@ function PartnerDetail() {
     }
   };
 
-  if (loading) {
+  if (loading || auth.loading || (!continuityReady && !continuityError)) {
     return (
       <div className="flex h-full items-center justify-center">
         <Loader2 className="h-5 w-5 animate-spin text-[var(--muted-foreground)]" />
@@ -321,6 +433,24 @@ function PartnerDetail() {
     );
   }
 
+  if (continuityError) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-3 text-[13px]">
+        <p className="text-[var(--muted-foreground)]">{t("Could not load browser sync state")}</p>
+        <button
+          type="button"
+          onClick={() => {
+            if (!accountId) window.location.reload();
+            else setContinuityRetry((value) => value + 1);
+          }}
+          className="rounded-md border border-[var(--border)] px-3 py-1.5 text-[var(--foreground)] hover:bg-[var(--muted)]"
+        >
+          {t("Retry")}
+        </button>
+      </div>
+    );
+  }
+
   const tabs: { key: Tab; label: string; icon: typeof MessageCircle }[] = [
     { key: "chat", label: t("Chat"), icon: MessageCircle },
     ...(canManage
@@ -329,7 +459,7 @@ function PartnerDetail() {
           { key: "channels", label: t("Channels"), icon: Radio },
         ] as const)
       : []),
-    { key: "archive", label: t("Archive"), icon: Archive },
+    { key: "archive", label: t("Conversations"), icon: Archive },
   ];
 
   return (
@@ -356,12 +486,15 @@ function PartnerDetail() {
               <span className="truncate text-[14px] font-medium text-[var(--foreground)]">
                 {partner.name}
               </span>
-              <span
-                title={partner.running ? t("Running") : t("Stopped")}
-                className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                  partner.running ? "bg-emerald-500" : "bg-[var(--border)]"
-                }`}
-              />
+              <span className="inline-flex shrink-0 items-center gap-1 text-[10px] text-[var(--muted-foreground)]">
+                <span
+                  aria-hidden
+                  className={`h-1.5 w-1.5 rounded-full ${
+                    partner.running ? "bg-emerald-500" : "bg-[var(--border)]"
+                  }`}
+                />
+                {partner.running ? t("Running") : t("Stopped")}
+              </span>
             </div>
             {partner.description ? (
               <p className="truncate text-[11.5px] text-[var(--muted-foreground)]">
@@ -390,38 +523,29 @@ function PartnerDetail() {
         </nav>
 
         <div className="flex min-w-0 items-center justify-end gap-0.5">
+          <Tooltip label={t("Share this conversation across browsers")}>
+            <label className="mr-1 inline-flex cursor-pointer items-center gap-1.5 text-[11px] text-[var(--muted-foreground)]">
+              <input
+                type="checkbox"
+                aria-label={t("Sync browsers")}
+                checked={continuityEnabled}
+                disabled={continuityBusy || switchingSession || runtimeContinuityError || chatBusy}
+                onChange={() => void toggleContinuity()}
+                className="h-3.5 w-3.5 accent-[var(--primary)]"
+              />
+              <span className="hidden whitespace-nowrap xl:inline">
+                {t("Sync browsers")}
+              </span>
+            </label>
+          </Tooltip>
           {(activeTab === "chat" || activeTab === "archive") && (
             <>
               {activeTab === "chat" ? (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => void toggleSessionRoaming()}
-                    disabled={!sessionKey || roamingBusy}
-                    aria-pressed={sessionRoaming}
-                    title={t(
-                      sessionRoaming
-                        ? "This Partner conversation follows your account across browsers"
-                        : "Continue this Partner conversation across browsers",
-                    )}
-                    aria-label={t("Partner conversation roaming")}
-                    className={`rounded-md p-1.5 hover:bg-[var(--muted)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-40 ${
-                      sessionRoaming
-                        ? "text-[var(--primary)]"
-                        : "text-[var(--muted-foreground)]"
-                    }`}
-                  >
-                    {roamingBusy ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Cloud className="h-4 w-4" />
-                    )}
-                  </button>
+                <Tooltip label={t("Archive")}>
                   <button
                     type="button"
                     onClick={() => void handleArchiveConversation()}
-                    disabled={!chatMessages.length || archiveBusy}
-                    title={t("Archive")}
+                    disabled={!chatMessages.length || archiveBusy || switchingSession || chatBusy}
                     aria-label={t("Archive")}
                     className="rounded-md p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-40"
                   >
@@ -431,64 +555,71 @@ function PartnerDetail() {
                       <Archive className="h-4 w-4" />
                     )}
                   </button>
-                </>
+                </Tooltip>
               ) : null}
-              <button
-                type="button"
-                onClick={() => setShowSaveModal(true)}
-                disabled={!canExport}
-                title={t("Save to Notebook")}
-                aria-label={t("Save to Notebook")}
-                className="rounded-md p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                <BookmarkPlus className="h-4 w-4" />
-              </button>
-              <button
-                type="button"
-                onClick={handleDownload}
-                disabled={!canExport}
-                title={t("Download chat history as Markdown")}
-                aria-label={t("Download Markdown")}
-                className="rounded-md p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                <Download className="h-4 w-4" />
-              </button>
+              <Tooltip label={t("Save to Notebook")}>
+                <button
+                  type="button"
+                  onClick={() => setShowSaveModal(true)}
+                  disabled={!canExport}
+                  aria-label={t("Save to Notebook")}
+                  className="rounded-md p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <BookmarkPlus className="h-4 w-4" />
+                </button>
+              </Tooltip>
+              <Tooltip label={t("Download chat history as Markdown")}>
+                <button
+                  type="button"
+                  onClick={handleDownload}
+                  disabled={!canExport}
+                  aria-label={t("Download Markdown")}
+                  className="rounded-md p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Download className="h-4 w-4" />
+                </button>
+              </Tooltip>
             </>
           )}
-          <button
-            type="button"
-            onClick={() => setShowLinkModal(true)}
-            title={t("Link a chat account")}
-            aria-label={t("Link a chat account")}
-            className="rounded-md p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
-          >
-            <Link2 className="h-4 w-4" />
-          </button>
+          <Tooltip label={t("Link a chat account")}>
+            <button
+              type="button"
+              onClick={() => setShowLinkModal(true)}
+              aria-label={t("Link a chat account")}
+              className="rounded-md p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
+            >
+              <Link2 className="h-4 w-4" />
+            </button>
+          </Tooltip>
           {canManage ? (
             <>
-              <button
-                type="button"
-                onClick={() => void toggleRunning()}
-                disabled={lifecycleBusy}
-                title={partner.running ? t("Stop") : t("Start")}
-                className="rounded-md p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)] disabled:opacity-40"
-              >
-                {lifecycleBusy ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : partner.running ? (
-                  <Square className="h-4 w-4" />
-                ) : (
-                  <Play className="h-4 w-4" />
-                )}
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleDestroy()}
-                title={t("Delete partner")}
-                className="rounded-md p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-red-500"
-              >
-                <Trash2 className="h-4 w-4" />
-              </button>
+              <Tooltip label={partner.running ? t("Stop") : t("Start")}>
+                <button
+                  type="button"
+                  onClick={() => void toggleRunning()}
+                  disabled={lifecycleBusy}
+                  aria-label={partner.running ? t("Stop") : t("Start")}
+                  className="rounded-md p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)] disabled:opacity-40"
+                >
+                  {lifecycleBusy ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : partner.running ? (
+                    <Square className="h-4 w-4" />
+                  ) : (
+                    <Play className="h-4 w-4" />
+                  )}
+                </button>
+              </Tooltip>
+              <Tooltip label={t("Delete partner")}>
+                <button
+                  type="button"
+                  onClick={() => void handleDestroy()}
+                  aria-label={t("Delete partner")}
+                  className="rounded-md p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-red-500"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </Tooltip>
             </>
           ) : null}
         </div>
@@ -500,6 +631,19 @@ function PartnerDetail() {
           partnerName={partner.name}
           onClose={() => setShowLinkModal(false)}
         />
+      ) : null}
+
+      {runtimeContinuityError ? (
+        <div className="flex items-center justify-center gap-2 border-b border-[var(--border)] px-4 py-2 text-[12px] text-[var(--muted-foreground)]">
+          {t("Could not load browser sync state")}
+          <button
+            type="button"
+            onClick={() => void reconcileSelection()}
+            className="rounded-md border border-[var(--border)] px-2 py-1 text-[var(--foreground)] hover:bg-[var(--muted)]"
+          >
+            {t("Retry")}
+          </button>
+        </div>
       ) : null}
 
       {/* Body. Chat stays mounted (hidden off-tab) so an in-progress turn —
@@ -518,6 +662,10 @@ function PartnerDetail() {
               onToast={setToast}
               onMessagesChange={setChatMessages}
               onRuntimeReady={handleRuntimeReady}
+              onBusyChange={setChatBusy}
+              switchingSession={switchingSession || continuityBusy || archiveBusy || runtimeContinuityError}
+              sharedAcrossBrowsers={continuityEnabled}
+              onSelectionStale={handleSelectionStale}
             />
           </div>
         </div>
@@ -527,8 +675,21 @@ function PartnerDetail() {
               partnerId={partnerId}
               onToast={setToast}
               onMessagesChange={setArchiveMessages}
-              onResume={(key) => {
-                void changeSessionKey(key);
+              onDeleted={(deletedKey, activeKey) => {
+                if (continuityEnabled) {
+                  if (activeKey) changeSessionKey(activeKey, true);
+                  else if (deletedKey === sessionKey) void reconcileSelection();
+                } else if (deletedKey === sessionKey) {
+                  changeSessionKey(freshPartnerSessionKey());
+                }
+              }}
+              onResume={(key, activeKey, didCallResume) => {
+                if (continuityEnabled && didCallResume) {
+                  if (activeKey) changeSessionKey(activeKey, true);
+                  else void reconcileSelection();
+                } else {
+                  changeSessionKey(key);
+                }
                 setTab("chat");
               }}
             />
