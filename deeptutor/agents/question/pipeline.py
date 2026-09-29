@@ -582,14 +582,6 @@ class QuestionPipeline:
                     client=client,
                 )
 
-            if not plan.templates:
-                await stream.progress(
-                    self._t("notices.plan_count_mismatch", got=0, requested=num_questions),
-                    source=SOURCE,
-                    stage=STAGE_PLANNING,
-                    metadata={"trace_kind": "warning"},
-                )
-
         # ----- Phase 3: Quiz (per-question) -----
         qa_pairs: list[QuizPair] = []
         async with stream.stage(STAGE_QUIZZING, source=SOURCE):
@@ -791,7 +783,16 @@ class QuestionPipeline:
             allowed_types=allowed_types,
             target_difficulty=difficulty,
         )
-        if len(plan.templates) != num_questions:
+        if not plan.templates:
+            # The retry above already gave a starved planner its second pass.
+            # Still nothing means phase 3 would iterate an empty list and ship
+            # a quiz of zero questions with no error anywhere — the shape
+            # #1318 took. Fail where the cause is still legible.
+            raise RuntimeError(self._t("notices.plan_unusable"))
+        if len(plan.templates) < num_questions:
+            # Fewer than asked is a smaller quiz, not a broken one: the
+            # learner would rather answer three real questions than read a
+            # failure. `_parse_plan` already caps the other direction.
             await stream.progress(
                 self._t(
                     "notices.plan_count_mismatch",
@@ -1009,6 +1010,33 @@ class QuestionPipeline:
             iter_meta=iter_meta,
             max_tokens=self._budgets["repair"]["max_tokens"],
         )
+        if step.reasoning_only:
+            # The round that exists to rescue a starved question is itself an
+            # LLM round and starves the same way (#1508), and nothing after it
+            # will ever ask again. Turn the thinking down, once.
+            await stream.progress(
+                self._t(
+                    "notices.repair_reasoning_retry",
+                    default=(
+                        "The repair round spent its whole budget reasoning; "
+                        "asking again with less thinking."
+                    ),
+                ),
+                source=SOURCE,
+                stage=STAGE_QUIZZING,
+                metadata={"trace_kind": "warning"},
+            )
+            step = await self._run_labeled_step(
+                client=client,
+                messages=messages,
+                tool_schemas=None,
+                protocol=_PROTOCOL_REPAIR,
+                stream=stream,
+                stage=STAGE_QUIZZING,
+                iter_meta=iter_meta,
+                max_tokens=self._budgets["repair"]["max_tokens"],
+                reasoning_effort=RETRY_REASONING_EFFORT,
+            )
         return self._parse_quiz_payload(step.text)
 
     # ------------------------------------------------------------------
@@ -1316,7 +1344,11 @@ class QuestionPipeline:
             }
             for qa_pair in qa_pairs
         ]
-        successful = sum(1 for qa in qa_pairs if not qa.metadata.get("error"))
+        # ``issues`` is what survives the repair attempt, so a non-empty list
+        # means the learner got a question that is still broken. ``error`` was
+        # read here but is written nowhere, so an all-placeholder quiz reported
+        # success=True / failed=0 and #1508 left no trace of having failed.
+        successful = sum(1 for qa in qa_pairs if not qa.metadata.get("issues"))
         markdown = self._render_summary_markdown(qa_pairs)
         finish_block = finish_text.strip()
         if finish_block:
